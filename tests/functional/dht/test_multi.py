@@ -19,6 +19,7 @@
 
 from time import sleep
 from re import search
+import glustolibs.gluster.constants as const
 from glusto.core import Glusto as g
 from glustolibs.gluster.exceptions import ExecutionError
 from glustolibs.gluster.gluster_base_class import GlusterBaseClass, runs_on
@@ -68,6 +69,20 @@ class TestDhtMultiCases(GlusterBaseClass):
         if not ret:
             raise ExecutionError("Failed to Setup_Volume and Mount_Volume")
         g.log.info("Successful in Setup Volume and Mount Volume")
+
+        self.client, self.m_point = (self.mounts[0].client_system,
+                                     self.mounts[0].mountpoint)
+        # Assign a variable for the first_client
+        self.first_client = self.mounts[0].client_system
+
+        self.files = (
+            'a.txt',
+            'b.txt',
+            'sub_folder/c.txt',
+            'sub_folder/d.txt'
+        )
+
+        self.temp_folder = '/tmp/%s' % uuid4()
 
     def tearDown(self):
 
@@ -803,6 +818,20 @@ class TestDhtMultiCases(GlusterBaseClass):
         # check file creation should fail
         ret, _, _ = g.run(self.clients[0], ("touch %s" % file_one))
         self.assertTrue(ret, "Expected file creation to fail")
+
+    def _validate_io(self):
+        """Validare I/O threads running on mount point"""
+        io_success = []
+        for proc in self.proc_list:
+            try:
+                ret, _, _ = proc.async_communicate()
+                if ret:
+                    io_success.append(False)
+                    break
+                io_success.append(True)
+            except ValueError:
+                io_success.append(True)
+        return all(io_success)
 
     def test_time_taken_for_ls(self):
         """
