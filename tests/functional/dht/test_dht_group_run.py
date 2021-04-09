@@ -17,6 +17,8 @@
 # pylint: disable=too-many-statements, undefined-loop-variable
 # pylint: disable=too-many-branches,too-many-locals,pointless-string-statement
 
+from uuid import uuid4
+from random import choice, randint
 from time import sleep
 from re import search
 import glustolibs.gluster.constants as const
@@ -25,18 +27,22 @@ from glustolibs.gluster.exceptions import ExecutionError
 from glustolibs.gluster.gluster_base_class import GlusterBaseClass, runs_on
 from glustolibs.gluster.brick_libs import get_all_bricks
 from glustolibs.gluster.dht_test_utils import validate_files_in_dir
-import glustolibs.gluster.constants as k
 from glustolibs.gluster.glusterfile import (get_fattr, get_pathinfo,
                                             get_fattr_list, get_file_stat, get_pathinfo,
                                             file_exists, create_link_file,
                                             get_md5sum)
 from glustolibs.gluster.glusterdir import mkdir
-from glustolibs.gluster.brick_libs import bring_bricks_offline
-from glustolibs.gluster.brick_libs import bring_bricks_online
-from glustolibs.gluster.volume_libs import get_subvols
+from glustolibs.gluster.brick_libs import (bring_bricks_online,
+                                           bring_bricks_offline,
+                                           are_bricks_offline,
+                                           are_bricks_online)
+from glustolibs.gluster.volume_libs import (get_subvols,
+                                            volume_start)
 from glustolibs.gluster.dht_test_utils import (
     find_new_hashed,
-    find_hashed_subvol)
+    find_hashed_subvol,
+    create_brickobjectlist,
+    find_nonhashed_subvol)
 from glustolibs.gluster.mount_ops import mount_volume, umount_volume
 from glustolibs.gluster.glusterfile import file_exists, move_file
 from glustolibs.gluster.constants import FILETYPE_DIRS
@@ -47,11 +53,10 @@ from glustolibs.gluster.constants import \
 from glustolibs.gluster.lib_utils import get_size_of_mountpoint
 from glustolibs.gluster.glusterfile import calculate_hash
 from glustolibs.gluster.brickdir import BrickDir
+from glustolibs.gluster.lib_utils import append_string_to_file
+from glustolibs.gluster.constants import TEST_LAYOUT_IS_COMPLETE
 
-
-@runs_on([['distributed', 'distributed-replicated',
-           'dispersed', 'distributed-dispersed', 'replicated',
-           'arbiter', 'distributed-arbiter'],
+@runs_on([['distributed', 'distributed-arbiter', 'distributed-replicated', 'distributed-dispersed'],
           ['glusterfs']])
 class TestDhtMultiCases(GlusterBaseClass):
 
@@ -59,41 +64,39 @@ class TestDhtMultiCases(GlusterBaseClass):
     Description: tests to check the dht layouts of files and directories,
                  along with their symlinks.
     """
-    def setUp(self):
+   
+    @classmethod
+    def setUpClass(cls):
 
         # Calling GlusterBaseClass setUp
-        self.get_super_method(self, 'setUp')()
+        cls.get_super_method(cls, 'setUpClass')()
 
         # Setup Volume and Mount Volume
-        ret = self.setup_volume_and_mount_volume(self.mounts)
+        ret = cls.setup_volume_and_mount_volume(cls.mounts)
         if not ret:
             raise ExecutionError("Failed to Setup_Volume and Mount_Volume")
         g.log.info("Successful in Setup Volume and Mount Volume")
 
-        self.client, self.m_point = (self.mounts[0].client_system,
-                                     self.mounts[0].mountpoint)
+        """
+        self.client, self.m_point = (cls.mounts[0].client_system,
+                                     cls.mounts[0].mountpoint)
         # Assign a variable for the first_client
-        self.first_client = self.mounts[0].client_system
-
-        self.files = (
-            'a.txt',
-            'b.txt',
-            'sub_folder/c.txt',
-            'sub_folder/d.txt'
-        )
+        self.first_client = cls.mounts[0].client_system
 
         self.temp_folder = '/tmp/%s' % uuid4()
+        """
 
-    def tearDown(self):
+    @classmethod
+    def tearDownClass(cls):
 
         # Unmount and cleanup original volume
-        ret = self.unmount_volume_and_cleanup_volume(mounts=self.mounts)
+        ret = cls.unmount_volume_and_cleanup_volume(mounts=cls.mounts)
         if not ret:
             raise ExecutionError("Failed to umount the vol & cleanup Volume")
         g.log.info("Successful in umounting the volume and Cleanup")
 
         # Calling GlusterBaseClass tearDown
-        self.get_super_method(self, 'tearDown')()
+        cls.get_super_method(cls, 'tearDownClass')()
 
     destination_exists = False
 
@@ -323,7 +326,7 @@ class TestDhtMultiCases(GlusterBaseClass):
 
         flag = validate_files_in_dir(self.clients[0],
                                      m_point + '/root_dir',
-                                     test_type=k.TEST_LAYOUT_IS_COMPLETE)
+                                     test_type=const.TEST_LAYOUT_IS_COMPLETE)
         self.assertTrue(flag, "Layout has some holes or overlaps")
         g.log.info("Layout is completely set")
 
@@ -387,7 +390,7 @@ class TestDhtMultiCases(GlusterBaseClass):
         self.assertTrue(flag, "Failed to create sub directories")
         flag = validate_files_in_dir(self.clients[0],
                                      fqpath_for_test_dir,
-                                     test_type=k.TEST_LAYOUT_IS_COMPLETE)
+                                     test_type=const.TEST_LAYOUT_IS_COMPLETE)
         self.assertTrue(flag, "Layout of test directory is not complete")
         g.log.info("Layout for directory is complete")
 
@@ -476,6 +479,7 @@ class TestDhtMultiCases(GlusterBaseClass):
 
     def test_copy_directory(self):
 
+        g.set_log_level('glustolog', 'glustolog2', 'WARNING')
         # Checking when destination directory for copying directory doesn't
         # exist
         self.destination_exists = False
@@ -485,236 +489,6 @@ class TestDhtMultiCases(GlusterBaseClass):
         # created directory
         self.destination_exists = True
         self.copy_dir()
-
-    def test_file_access(self):
-        """
-        Test file access.
-        """
-        # pylint: disable=protected-access
-        # pylint: disable=too-many-locals
-        # pylint: disable=too-many-statements
-        mount_obj = self.mounts[0]
-        mountpoint = mount_obj.mountpoint
-
-        # get subvol list
-        subvols = (get_subvols(self.mnode, self.volname))['volume_subvols']
-        self.assertIsNotNone(subvols, "failed to get subvols")
-
-        # create a file
-        srcfile = mountpoint + '/testfile'
-        ret, _, err = g.run(self.clients[0], ("touch %s" % srcfile))
-        self.assertEqual(ret, 0, ("File creation failed for %s err %s",
-                                  srcfile, err))
-        g.log.info("testfile creation successful")
-
-        # find hashed subvol
-        srchashed, scount = find_hashed_subvol(subvols, "/", "testfile")
-        self.assertIsNotNone(srchashed, "could not find srchashed")
-        g.log.info("hashed subvol for srcfile %s subvol count %s",
-                   srchashed._host, str(scount))
-
-        # rename the file such that the new name hashes to a new subvol
-        tmp = find_new_hashed(subvols, "/", "testfile")
-        self.assertIsNotNone(tmp, "could not find new hashed for dstfile")
-        g.log.info("dst file name : %s dst hashed_subvol : %s "
-                   "subvol count : %s", tmp.newname,
-                   tmp.hashedbrickobject._host, str(tmp.subvol_count))
-
-        dstname = str(tmp.newname)
-        dstfile = mountpoint + "/" + dstname
-        dsthashed = tmp.hashedbrickobject
-        dcount = tmp.subvol_count
-        ret, _, err = g.run(self.clients[0], ("mv %s %s" %
-                                              (srcfile, dstfile)))
-        self.assertEqual(ret, 0, ("rename failed for %s err %s",
-                                  srcfile, err))
-        g.log.info("cmd: mv srcfile dstfile successful")
-
-        # check that on dsthash_subvol the file is a linkto file
-        filepath = dsthashed._fqpath + "/" + dstname
-        file_stat = get_file_stat(dsthashed._host, filepath)
-        self.assertEqual(file_stat['access'], "1000", ("Expected file "
-                                                       "permission to be 1000"
-                                                       " on subvol %s",
-                                                       dsthashed._host))
-        g.log.info("dsthash_subvol has the expected linkto file")
-
-        # check on srchashed the file is a data file
-        filepath = srchashed._fqpath + "/" + dstname
-        file_stat = get_file_stat(srchashed._host, filepath)
-        self.assertNotEqual(file_stat['access'], "1000", ("Expected file "
-                                                          "permission not to"
-                                                          "be 1000 on subvol"
-                                                          "%s",
-                                                          srchashed._host))
-
-        # Bring down the hashed subvol of dstfile(linkto file)
-        ret = bring_bricks_offline(self.volname, subvols[dcount])
-        self.assertTrue(ret, ('Error in bringing down subvolume %s',
-                              subvols[dcount]))
-        g.log.info('dst subvol %s is offline', subvols[dcount])
-
-        # Need to access the file through a fresh lookup through a new mount
-        # create a new dir(choosing server to do a mount)
-        ret, _, _ = g.run(self.mnode, ("mkdir -p /mnt"))
-        self.assertEqual(ret, 0, ('mkdir of mount dir failed'))
-        g.log.info("mkdir of mount dir succeeded")
-
-        # do a temp mount
-        ret = mount_volume(self.volname, self.mount_type, "/mnt",
-                           self.mnode, self.mnode)
-        self.assertTrue(ret, ('temporary mount failed'))
-        g.log.info("temporary mount succeeded")
-
-        # check that file is accessible (stat)
-        ret, _, _ = g.run(self.mnode, ("stat /mnt/%s" % dstname))
-        self.assertEqual(ret, 0, ('stat error on for dst file %s', dstname))
-        g.log.info("stat on /mnt/%s successful", dstname)
-
-        # cleanup temporary mount
-        ret = umount_volume(self.mnode, "/mnt")
-        self.assertTrue(ret, ('temporary mount failed'))
-        g.log.info("umount successful")
-
-        # Bring up the hashed subvol
-        ret = bring_bricks_online(self.mnode, self.volname, subvols[dcount],
-                                  bring_bricks_online_methods=None)
-        self.assertTrue(ret, "Error in bringing back subvol online")
-        g.log.info('Subvol is back online')
-
-        # now bring down the cached subvol
-        ret = bring_bricks_offline(self.volname, subvols[scount])
-        self.assertTrue(ret, ('Error in bringing down subvolume %s',
-                              subvols[scount]))
-        g.log.info('target subvol %s is offline', subvols[scount])
-
-        # file access should fail
-        ret, _, _ = g.run(self.clients[0], ("stat %s" % dstfile))
-        self.assertEqual(ret, 1, ('stat error on for file %s', dstfile))
-        g.log.info("dstfile access failed as expected")
-
-    def test_distribution_hash_value(self):
-        """Test case tests DHT of files and directories based on hash value
-        """
-        # pylint: disable=too-many-locals
-        for client_index, mount_obj in enumerate(self.mounts):
-            client_host = mount_obj.client_system
-            mountpoint = mount_obj.mountpoint
-
-            # Create directory for initial data
-            g.log.debug("Creating temporary folder on client's machine %s:%s",
-                        client_host, self.temp_folder)
-            if not mkdir(client_host, self.temp_folder):
-                g.log.error("Failed create temporary directory "
-                            "on client machine %s:%s",
-                            client_host, self.temp_folder)
-                raise ExecutionError("Failed create temporary directory "
-                                     "on client machine %s:%s" %
-                                     (client_host, self.temp_folder))
-            g.log.info('Created temporary directory on client machine %s:%s',
-                       client_host, self.temp_folder)
-            # Prepare a set of data
-            files = ["{prefix}{file_name}_{client_index}".
-                     format(file_name=file_name,
-                            client_index=client_index,
-                            prefix='' if randint(1, 6) % 2
-                            else choice('ABCD') + '/')
-                     for file_name in map(chr, range(97, 123))]
-            ret = self.create_files(client_host, self.temp_folder,
-                                    files,
-                                    "Lorem Ipsum is simply dummy text of the "
-                                    "printing and typesetting industry.")
-            self.assertTrue(ret, "Failed creating a set of files and dirs "
-                                 "on %s:%s" % (client_host, self.temp_folder))
-            g.log.info('Created data set on client machine on folder %s:%s',
-                       client_host, self.temp_folder)
-
-            # Copy prepared data to mount point
-            cmd = ('cp -vr {source}/* {destination}'.format(
-                source=self.temp_folder,
-                destination=mountpoint))
-            ret, _, _ = g.run(client_host, cmd)
-            self.assertEqual(ret, 0, "Copy data to mount point %s:%s Failed")
-            g.log.info('Copied prepared data to mount point %s:%s',
-                       client_host, mountpoint)
-
-            # Verify that hash layout values are set on each
-            # bricks for the dir
-            g.log.debug("Verifying DHT layout")
-            ret = validate_files_in_dir(client_host, mountpoint,
-                                        test_type=TEST_LAYOUT_IS_COMPLETE)
-            self.assertTrue(ret, "TEST_LAYOUT_IS_COMPLETE: FAILED")
-            g.log.info("TEST_LAYOUT_IS_COMPLETE: PASS on %s:%s ",
-                       client_host, mountpoint)
-
-            g.log.debug("Verifying files and directories")
-            ret = validate_files_in_dir(client_host, mountpoint,
-                                        test_type=FILE_ON_HASHED_BRICKS,
-                                        file_type=FILETYPE_DIRS)
-            self.assertTrue(ret, "TEST_FILE_EXISTS_ON_HASHED_BRICKS: FAILED")
-            g.log.info("TEST_FILE_EXISTS_ON_HASHED_BRICKS: PASS")
-
-            # Verify "trusted.gfid" extended attribute of the
-            # directory/file on all the bricks
-            gfids = dict()
-            g.log.debug("Check if trusted.gfid is presented on the bricks")
-            for brick_item in get_all_bricks(self.mnode, self.volname):
-                brick_host, brick_dir = brick_item.split(':')
-
-                for target_destination in files:
-                    if not file_exists(brick_host, '{brick_dir}/{dest}'.
-                                       format(brick_dir=brick_dir,
-                                              dest=target_destination)):
-                        continue
-                    ret = get_fattr(brick_host, '%s/%s' %
-                                    (brick_dir, target_destination),
-                                    'trusted.gfid')
-                    self.assertIsNotNone(ret,
-                                         "trusted.gfid is not presented "
-                                         "on %s/%s" % (brick_dir,
-                                                       target_destination))
-                    g.log.info("Verified trusted.gfid on brick %s:%s",
-                               brick_item, target_destination)
-                    gfids.setdefault(target_destination, []).append(ret)
-
-            g.log.debug('Check if trusted.gfid is same on all the bricks')
-            self.assertTrue(all([False if len(set(gfids[k])) > 1 else True
-                                 for k in gfids]),
-                            "trusted.gfid should be same on all the bricks")
-            g.log.info('trusted.gfid is same on all the bricks')
-            # Verify that mount point shows pathinfo xattr.
-            g.log.debug("Check if pathinfo is presented on mount point "
-                        "%s:%s", client_host, mountpoint)
-            ret = get_fattr(client_host, mountpoint,
-                            'trusted.glusterfs.pathinfo')
-            self.assertIsNotNone(ret, "pathinfo is not presented on mount "
-                                      "point %s:%s" % (client_host,
-                                                       mountpoint))
-
-            g.log.info('trusted.glusterfs.pathinfo is presented on mount'
-                       ' point %s:%s', client_host, mountpoint)
-
-            # Mount point should not display xattr:
-            # trusted.gfid and trusted.glusterfs.dht
-            g.log.debug("Check if trusted.gfid and trusted.glusterfs.dht are "
-                        "not presented on mount point %s:%s", client_host,
-                        mountpoint)
-            attributes = get_fattr_list(client_host, mountpoint)
-            self.assertFalse('trusted.gfid' in attributes,
-                             "Expected: Mount point shouldn't display xattr:"
-                             "{xattr}. Actual: xattrs {xattr} is "
-                             "presented on mount point".
-                             format(xattr='trusted.gfid'))
-            self.assertFalse('trusted.glusterfs.dht' in attributes,
-                             "Expected: Mount point shouldn't display xattr:"
-                             "{xattr}. Actual: xattrs {xattr} is "
-                             "presented on mount point".
-                             format(xattr='trusted.glusterfs.dht'))
-
-            g.log.info("trusted.gfid and trusted.glusterfs.dht are not "
-                       "presented on mount point %s:%s", client_host,
-                       mountpoint)
-        g.log.info('Files and dirs are stored on bricks based on hash value')
 
     def test_create_file(self):
         '''
@@ -810,7 +584,7 @@ class TestDhtMultiCases(GlusterBaseClass):
         # delete the file, bring down it's hash, create the file,
         ret, _, _ = g.run(self.clients[0], ("rm -f %s" % file_one))
         self.assertEqual(ret, 0, "file deletion for file1 failed")
-
+        
         ret = bring_bricks_offline(self.volname, hash_subvol)
         self.assertTrue(ret, ('Error in bringing down subvolume %s',
                               hash_subvol))
@@ -818,357 +592,12 @@ class TestDhtMultiCases(GlusterBaseClass):
         # check file creation should fail
         ret, _, _ = g.run(self.clients[0], ("touch %s" % file_one))
         self.assertTrue(ret, "Expected file creation to fail")
-
-    def _validate_io(self):
-        """Validare I/O threads running on mount point"""
-        io_success = []
-        for proc in self.proc_list:
-            try:
-                ret, _, _ = proc.async_communicate()
-                if ret:
-                    io_success.append(False)
-                    break
-                io_success.append(True)
-            except ValueError:
-                io_success.append(True)
-        return all(io_success)
-
-    def test_time_taken_for_ls(self):
-        """
-        Test case:
-        1. Create a volume of type distributed-replicated or
-           distributed-arbiter or distributed-dispersed and start it.
-        2. Mount the volume to clients and create 2000 directories
-           and 10 files inside each directory.
-        3. Wait for I/O to complete on mount point and perform ls
-           (ls should complete within 10 seconds).
-        """
-        # Creating 2000 directories on the mount point
-        ret, _, _ = g.run(self.mounts[0].client_system,
-                          "cd %s; for i in {1..2000};do mkdir dir$i;done"
-                          % self.mounts[0].mountpoint)
-        self.assertFalse(ret, 'Failed to create 2000 dirs on mount point')
-
-        # Create 5000 files inside each directory
-        dirs = ('{1..100}', '{101..200}', '{201..300}', '{301..400}',
-                '{401..500}', '{501..600}', '{601..700}', '{701..800}',
-                '{801..900}', '{901..1000}', '{1001..1100}', '{1101..1200}',
-                '{1201..1300}', '{1301..1400}', '{1401..1500}', '{1501..1600}',
-                '{1801..1900}', '{1901..2000}')
-        self.proc_list, counter = [], 0
-        while counter < 18:
-            for mount_obj in self.mounts:
-                ret = g.run_async(mount_obj.client_system,
-                                  "cd %s;for i in %s;do "
-                                  "touch dir$i/file{1..10};done"
-                                  % (mount_obj.mountpoint, dirs[counter]))
-                self.proc_list.append(ret)
-                counter += 1
-        self.is_io_running = True
-
-        # Check if I/O is successful or not
-        ret = self._validate_io()
-        self.assertTrue(ret, "Failed to create Files and dirs on mount point")
-        self.is_io_running = False
-        g.log.info("Successfully created files and dirs needed for the test")
-
-        # Run ls on mount point which should get completed within 10 seconds
-        ret, _, _ = g.run(self.mounts[0].client_system,
-                          "cd %s; timeout 10 ls"
-                          % self.mounts[0].mountpoint)
-        self.assertFalse(ret, '1s taking more than 10 seconds')
-        g.log.info("ls completed in under 10 seconds")
-
-    def test_rename_directory_no_destination_folder(self):
-        """Test rename directory with no destination folder"""
-        dirs = {
-            'initial': '{root}/folder_{client_index}',
-            'new_folder': '{root}/folder_renamed{client_index}'
-        }
-
-        for mount_index, mount_obj in enumerate(self.mounts):
-            client_host = mount_obj.client_system
-            mountpoint = mount_obj.mountpoint
-            initial_folder = dirs['initial'].format(
-                root=mount_obj.mountpoint,
-                client_index=mount_index
-            )
-
-            ret = validate_files_in_dir(client_host, mountpoint,
-                                        test_type=LAYOUT_IS_COMPLETE,
-                                        file_type=FILETYPE_DIRS)
-            self.assertTrue(ret, "Expected - Layout is complete")
-            g.log.info('Layout is complete')
-
-            # Create source folder on mount point
-            self.assertTrue(mkdir(client_host, initial_folder),
-                            'Failed creating source directory')
-            self.assertTrue(file_exists(client_host, initial_folder))
-            g.log.info('Created source directory %s on mount point %s',
-                       initial_folder, mountpoint)
-
-            # Create files and directories
-            ret = self.create_files(client_host, initial_folder, self.files,
-                                    content='Textual content')
-
-            self.assertTrue(ret, 'Unable to create files on mount point')
-            g.log.info('Files and directories are created')
-
-            ret = validate_files_in_dir(client_host, mountpoint,
-                                        test_type=FILE_ON_HASHED_BRICKS)
-            self.assertTrue(ret, "Expected - Files and dirs are stored "
-                            "on hashed bricks")
-            g.log.info('Files and dirs are stored on hashed bricks')
-
-            new_folder_name = dirs['new_folder'].format(
-                root=mountpoint,
-                client_index=mount_index
-            )
-            # Check if destination dir does not exist
-            self.assertFalse(file_exists(client_host, new_folder_name),
-                             'Expected New folder name should not exists')
-            # Rename source folder
-            ret = move_file(client_host, initial_folder,
-                            new_folder_name)
-            self.assertTrue(ret, "Rename direcoty failed")
-            g.log.info('Renamed directory %s to %s', initial_folder,
-                       new_folder_name)
-
-            # Old dir does not exists and destination is presented
-            self.assertFalse(file_exists(client_host, initial_folder),
-                             '%s should be not listed' % initial_folder)
-            g.log.info('The old directory %s does not exists on mount point',
-                       initial_folder)
-            self.assertTrue(file_exists(client_host, new_folder_name),
-                            'Destination dir does not exists %s' %
-                            new_folder_name)
-            g.log.info('The new folder is presented %s', new_folder_name)
-
-            # Check bricks for source and destination directories
-            for brick_item in get_all_bricks(self.mnode, self.volname):
-                brick_host, brick_dir = brick_item.split(':')
-
-                initial_folder = dirs['initial'].format(
-                    root=brick_dir,
-                    client_index=mount_index
-                )
-                new_folder_name = dirs['new_folder'].format(
-                    root=brick_dir,
-                    client_index=mount_index
-                )
-
-                self.assertFalse(file_exists(brick_host, initial_folder),
-                                 "Expected folder %s to be not presented" %
-                                 initial_folder)
-                self.assertTrue(file_exists(brick_host, new_folder_name),
-                                'Expected folder %s to be presented' %
-                                new_folder_name)
-
-                g.log.info('The old directory %s does not exists and directory'
-                           ' %s is presented', initial_folder, new_folder_name)
-        g.log.info('Rename directory when destination directory '
-                   'does not exists is successful')
-
-    def test_rename_directory_with_dest_folder(self):
-        """Test rename directory with presented destination folder
-        """
-        dirs = {
-            'initial_folder': '{root}/folder_{client_index}/',
-            'new_folder': '{root}/new_folder_{client_index}/'
-        }
-
-        for mount_index, mount_obj in enumerate(self.mounts):
-            client_host = mount_obj.client_system
-            mountpoint = mount_obj.mountpoint
-
-            initial_folder = dirs['initial_folder'].format(
-                root=mount_obj.mountpoint,
-                client_index=mount_index
-            )
-
-            ret = validate_files_in_dir(client_host, mountpoint,
-                                        test_type=LAYOUT_IS_COMPLETE,
-                                        file_type=FILETYPE_DIRS)
-            self.assertTrue(ret, "Expected - Layout is complete")
-            g.log.info('Layout is complete')
-
-            # Create a folder on mount point
-            self.assertTrue(mkdir(client_host, initial_folder, parents=True),
-                            'Failed creating source directory')
-            self.assertTrue(file_exists(client_host, initial_folder))
-            g.log.info('Created source directory %s on mount point %s',
-                       initial_folder, mountpoint)
-
-            new_folder_name = dirs['new_folder'].format(
-                root=mountpoint,
-                client_index=mount_index
-            )
-            # Create destination directory
-            self.assertTrue(mkdir(client_host, new_folder_name, parents=True),
-                            'Failed creating destination directory')
-            self.assertTrue(file_exists(client_host, new_folder_name))
-            g.log.info('Created destination directory %s on mount point %s',
-                       new_folder_name, mountpoint)
-
-            # Create files and directories
-            ret = self.create_files(client_host, initial_folder, self.files,
-                                    content='Textual content')
-            self.assertTrue(ret, 'Unable to create files on mount point')
-            g.log.info('Files and directories are created')
-
-            ret = validate_files_in_dir(client_host, mountpoint,
-                                        test_type=FILE_ON_HASHED_BRICKS)
-            self.assertTrue(ret, "Expected - Files and dirs are stored "
-                            "on hashed bricks")
-            g.log.info('Files and dirs are stored on hashed bricks')
-
-            # Rename source folder to destination
-            ret = move_file(client_host, initial_folder,
-                            new_folder_name)
-            self.assertTrue(ret, "Rename folder failed")
-            g.log.info('Renamed folder %s to %s', initial_folder,
-                       new_folder_name)
-
-            # Old dir does not exists and destination is presented
-            self.assertFalse(file_exists(client_host, initial_folder),
-                             '%s should be not listed' % initial_folder)
-            g.log.info('The old directory %s does not exists on mount point',
-                       initial_folder)
-            self.assertTrue(file_exists(client_host, new_folder_name),
-                            'Renamed directory does not exists %s' %
-                            new_folder_name)
-            g.log.info('The new folder exists %s', new_folder_name)
-
-            # Check bricks for source and destination directories
-            for brick_item in get_all_bricks(self.mnode, self.volname):
-                brick_host, brick_dir = brick_item.split(':')
-
-                initial_folder = dirs['initial_folder'].format(
-                    root=brick_dir,
-                    client_index=mount_index
-                )
-                new_folder_name = dirs['new_folder'].format(
-                    root=brick_dir,
-                    client_index=mount_index
-                )
-
-                self.assertFalse(file_exists(brick_host, initial_folder),
-                                 "Expected folder %s to be not presented" %
-                                 initial_folder)
-                self.assertTrue(file_exists(brick_host, new_folder_name),
-                                'Expected folder %s to be presented' %
-                                new_folder_name)
-
-                g.log.info('The old directory %s does not exists and directory'
-                           ' %s is presented', initial_folder, new_folder_name)
-        g.log.info('Rename directory when destination directory '
-                   'exists is successful')
-
-    def _create_two_sparse_files(self):
-        """Create 2 sparse files from /dev/zero and /dev/null"""
-
-        # Create a tuple to hold both the file names
-        self.sparse_file_tuple = (
-            "{}/sparse_file_zero".format(self.mounts[0].mountpoint),
-            "{}/sparse_file_null".format(self.mounts[0].mountpoint)
-            )
-
-        # Create 2 spares file where one is created from /dev/zero and
-        # another is created from /dev/null
-        for filename, input_file in ((self.sparse_file_tuple[0], "/dev/zero"),
-                                     (self.sparse_file_tuple[1], "/dev/null")):
-            cmd = ("dd if={} of={} bs=1M seek=5120 count=1000"
-                   .format(input_file, filename))
-            ret, _, _ = g.run(self.first_client, cmd)
-            self.assertEqual(ret, 0, 'Failed to create %s ' % filename)
-
-        g.log.info("Successfully created sparse_file_zero and"
-                   " sparse_file_null")
-
-    def _check_du_and_ls_of_sparse_file(self):
-        """Check du and ls -lks on spare files"""
-
-        for filename in self.sparse_file_tuple:
-
-            # Fetch output of ls -lks for the sparse file
-            cmd = "ls -lks {}".format(filename)
-            ret, out, _ = g.run(self.first_client, cmd)
-            self.assertEqual(ret, 0, "Failed to get ls -lks for file %s "
-                             % filename)
-            ls_value = out.split(" ")[5]
-
-            # Fetch output of du for the sparse file
-            cmd = "du --block-size=1 {}".format(filename)
-            ret, out, _ = g.run(self.first_client, cmd)
-            self.assertEqual(ret, 0, "Failed to get du for file %s "
-                             % filename)
-            du_value = out.split("\t")[0]
-
-            # Compare du and ls -lks value
-            self. assertNotEqual(ls_value, du_value,
-                                 "Unexpected: Sparse file size coming up same "
-                                 "for du and ls -lks")
-
-        g.log.info("Successfully checked sparse file size using ls and du")
-
-    def _delete_two_sparse_files(self):
-        """Delete sparse files"""
-
-        for filename in self.sparse_file_tuple:
-            cmd = "rm -rf {}".format(filename)
-            ret, _, _ = g.run(self.first_client, cmd)
-            self.assertEqual(ret, 0, 'Failed to delete %s ' % filename)
-
-        g.log.info("Successfully remove both sparse files")
-
-    def test_sparse_file_creation_and_deletion(self):
-        """
-        Test case:
-        1. Create volume with 5 sub-volumes, start and mount it.
-        2. Check df -h for available size.
-        3. Create 2 sparse file one from /dev/null and one from /dev/zero.
-        4. Find out size of files and compare them through du and ls.
-           (They shouldn't match.)
-        5. Check df -h for available size.(It should be less than step 2.)
-        6. Remove the files using rm -rf.
-        """
-        # Check df -h for avaliable size
-        available_space_at_start = get_size_of_mountpoint(
-            self.first_client, self.mounts[0].mountpoint)
-        self.assertIsNotNone(available_space_at_start,
-                             "Failed to get available space on mount point")
-
-        # Create 2 sparse file one from /dev/null and one from /dev/zero
-        self._create_two_sparse_files()
-
-        # Find out size of files and compare them through du and ls
-        # (They shouldn't match)
-        self._check_du_and_ls_of_sparse_file()
-
-        # Check df -h for avaliable size(It should be less than step 2)
-        available_space_now = get_size_of_mountpoint(
-            self.first_client, self.mounts[0].mountpoint)
-        self.assertIsNotNone(available_space_now,
-                             "Failed to get avaliable space on mount point")
-        ret = (int(available_space_at_start) > int(available_space_now))
-        self.assertTrue(ret, "Available space at start not less than "
-                        "available space now")
-
-        # Remove the files using rm -rf
-        self._delete_two_sparse_files()
-
-        # Sleep for 180 seconds for the meta data in .glusterfs directory
-        # to be removed
-        sleep(180)
-
-        # Check df -h after removing sparse files
-        available_space_now = get_size_of_mountpoint(
-            self.first_client, self.mounts[0].mountpoint)
-        self.assertIsNotNone(available_space_now,
-                             "Failed to get avaliable space on mount point")
-        ret = int(available_space_at_start) - int(available_space_now) < 1500
-        self.assertTrue(ret, "Available space at start and available space now"
-                        " is not equal")
+        
+         # Bring up the subvol - restart volume
+        ret = volume_start(self.mnode, self.volname, force=True)
+        self.assertTrue(ret, "Error in force start the volume")
+        g.log.info('Volume restart success')
+        sleep(10)
 
     def _create_file_using_touch(self, file_name):
         """Creates a regular empty file"""
@@ -1364,7 +793,6 @@ class TestDhtMultiCases(GlusterBaseClass):
     def test_special_file_creation(self):
         """
         Description : check creation of different types of files.
-
         Steps:
         1) From mount point, Create a regular file
         eg:
@@ -1389,6 +817,8 @@ class TestDhtMultiCases(GlusterBaseClass):
            accordingly(from mount point and sub-volume)
            " stat / "
         """
+
+        self.client, self.m_point = (self.mounts[0].client_system, self.mounts[0].mountpoint)
         # pylint: disable=too-many-statements
         # pylint: disable=too-many-locals
         # Create a regular file
@@ -1500,7 +930,7 @@ class TestDhtMultiCases(GlusterBaseClass):
         # Check if the ctime has changed on bricks as per mount
         self._compare_file_permissions(
             "regfile", reg_mnt_ctime_2, reg_brick_ctime_2)
-
+   
     def test_hard_link_file(self):
         """
         Description: link file create, validate and access file
@@ -1521,6 +951,9 @@ class TestDhtMultiCases(GlusterBaseClass):
            file inode, permission, size should be same
         8) From sub-volume verify that content of file are same
         """
+
+        self.client, self.m_point = (self.mounts[0].client_system, self.mounts[0].mountpoint)
+
         # Create a regular file
         self._create_file_using_touch("test_file")
 
@@ -1574,6 +1007,8 @@ class TestDhtMultiCases(GlusterBaseClass):
            "readlink "
         8) From sub-volume verify that content of file are same
         """
+
+        self.client, self.m_point = (self.mounts[0].client_system, self.mounts[0].mountpoint)
         # Create a regular file on mountpoint
         self._create_file_using_touch("test_file")
 
@@ -1611,3 +1046,364 @@ class TestDhtMultiCases(GlusterBaseClass):
 
         # Check the md5sum on original and symbolic-link file on backend bricks
         self._compare_file_md5sum_on_bricks("softlink_file")
+
+    def test_mkdir_with_subvol_down(self):
+        '''
+        Test mkdir hashed to a down subvol
+        '''
+        # pylint: disable=too-many-locals
+        # pylint: disable=too-many-branches
+        # pylint: disable=too-many-statements
+        # pylint: disable=W0212
+        mount_obj = self.mounts[0]
+        mountpoint = mount_obj.mountpoint
+
+        # directory that needs to be created
+        parent_dir = mountpoint + '/parent'
+        child_dir = mountpoint + '/parent/child'
+
+        # get hashed subvol for name "parent"
+        subvols = (get_subvols(self.mnode, self.volname))['volume_subvols']
+        hashed, count = find_hashed_subvol(subvols, "/", "parent")
+        self.assertIsNotNone(hashed, "Could not find hashed subvol")
+
+        # bring target_brick offline
+        bring_bricks_offline(self.volname, subvols[count])
+        ret = are_bricks_offline(self.mnode, self.volname, subvols[count])
+        self.assertTrue(ret, ('Error in bringing down subvolume %s',
+                              subvols[count]))
+        g.log.info('target subvol is offline')
+
+        # create parent dir
+        ret, _, err = g.run(self.clients[0], ("mkdir %s" % parent_dir))
+        self.assertNotEqual(ret, 0, ('Expected mkdir of %s to fail with %s',
+                                     parent_dir, err))
+        g.log.info('mkdir of dir %s failed as expected', parent_dir)
+
+        # check that parent_dir does not exist on any bricks and client
+        brickobject = create_brickobjectlist(subvols, "/")
+        for brickdir in brickobject:
+            adp = "%s/parent" % brickdir.path
+            bpath = adp.split(":")
+            self.assertTrue((file_exists(brickdir._host, bpath[1])) == 0,
+                            ('Expected dir %s not to exist on servers',
+                             parent_dir))
+
+        for client in self.clients:
+            self.assertTrue((file_exists(client, parent_dir)) == 0,
+                            ('Expected dir %s not to exist on clients',
+                             parent_dir))
+
+        g.log.info('dir %s does not exist on mount as expected', parent_dir)
+
+        # Bring up the subvols and create parent directory
+        bring_bricks_online(self.mnode, self.volname, subvols[count],
+                            bring_bricks_online_methods=None)
+        ret = are_bricks_online(self.mnode, self.volname, subvols[count])
+        self.assertTrue(ret, ("Error in bringing back subvol %s online",
+                              subvols[count]))
+        g.log.info('Subvol is back online')
+
+        ret, _, _ = g.run(self.clients[0], ("mkdir %s" % parent_dir))
+        self.assertEqual(ret, 0, ('Expected mkdir of %s to succeed',
+                                  parent_dir))
+        g.log.info('mkdir of dir %s successful', parent_dir)
+
+        # get hash subvol for name "child"
+        hashed, count = find_hashed_subvol(subvols, "parent", "child")
+        self.assertIsNotNone(hashed, "Could not find hashed subvol")
+
+        # bring target_brick offline
+        bring_bricks_offline(self.volname, subvols[count])
+        ret = are_bricks_offline(self.mnode, self.volname, subvols[count])
+        self.assertTrue(ret, ('Error in bringing down subvolume %s',
+                              subvols[count]))
+        g.log.info('target subvol is offline')
+
+        # create child dir
+        ret, _, err = g.run(self.clients[0], ("mkdir %s" % child_dir))
+        self.assertNotEqual(ret, 0, ('Expected mkdir of %s to fail with %s',
+                                     child_dir, err))
+        g.log.info('mkdir of dir %s failed', child_dir)
+
+        # check if child_dir exists on any bricks
+        for brickdir in brickobject:
+            adp = "%s/parent/child" % brickdir.path
+            bpath = adp.split(":")
+            self.assertTrue((file_exists(brickdir._host, bpath[1])) == 0,
+                            ('Expected dir %s not to exist on servers',
+                             child_dir))
+        for client in self.clients:
+            self.assertTrue((file_exists(client, child_dir)) == 0)
+
+        g.log.info('dir %s does not exist on mount as expected', child_dir)
+
+        # Bring up the subvol - restart volume                                 
+        ret = volume_start(self.mnode, self.volname, force=True)                
+        self.assertTrue(ret, "Error in force start the volume")                 
+        g.log.info('Volume restart success')                                    
+        sleep(10)
+
+    def mkdir_post_hashdown(self, subvols, parent_dir):
+        '''
+        case -1:
+        - bring down a subvol
+        - create a directory so that it does not hash to down subvol
+        - make sure stat is successful on the dir
+        '''
+        # pylint: disable=protected-access
+        # pylint: disable=pointless-string-statement
+        # Find a non hashed subvolume(or brick)
+        nonhashed_subvol, count = find_nonhashed_subvol(subvols, "/", "parent")
+        if nonhashed_subvol is None:
+            g.log.error('Error in finding nonhashed subvol for parent')
+            return False
+
+        # bring nonhashed_subbvol offline
+        ret = bring_bricks_offline(self.volname, subvols[count])
+        if ret == 0:
+            g.log.error('Error in bringing down subvolume %s',
+                        subvols[count])
+            return False
+
+        g.log.info('target subvol %s is offline', subvols[count])
+
+        # create parent dir
+        ret, _, err = g.run(self.clients[0], ("mkdir %s" % parent_dir))
+        if ret != 0:
+            g.log.error('mkdir failed for %s err: %s', parent_dir, err)
+            return False
+        g.log.info("mkdir of parent directory %s successful", parent_dir)
+
+        # this confirms both layout and stat of the directory
+        ret = validate_files_in_dir(self.clients[0],
+                                    self.mounts[0].mountpoint + '/parent_dir',
+                                    test_type=LAYOUT_IS_COMPLETE,
+                                    file_type=FILETYPE_DIRS)
+        self.assertTrue(ret, "Layout is not complete")
+        g.log.info('Layout is complete')
+
+        # bring up the subvol
+        ret = bring_bricks_online(self.mnode, self.volname, subvols[count],
+                                  bring_bricks_online_methods=None)
+        if ret == 0:
+            g.log.error("Error in bringing back subvol online")
+            return False
+
+        g.log.info('Subvol is back online')
+
+        # delete parent_dir
+        ret, _, err = g.run(self.clients[0], ("rmdir %s" % parent_dir))
+        if ret != 0:
+            g.log.error('rmdir failed for %s err: %s', parent_dir, err)
+        g.log.info("rmdir of directory %s successful", parent_dir)
+
+        return True
+
+    def mkdir_before_hashdown(self, subvols, parent_dir):
+        '''
+        case -2:
+            - create directory
+            - bring down hashed subvol
+            - make sure stat is successful on the dir
+        '''
+        # pylint: disable=protected-access
+        # pylint: disable=pointless-string-statement
+        # create parent dir
+        ret, _, err = g.run(self.clients[0], ("mkdir %s" % parent_dir))
+        if ret != 0:
+            g.log.error('mkdir failed for %s err: %s', parent_dir, err)
+            return False
+        g.log.info("mkdir of parent directory %s successful", parent_dir)
+
+        # find hashed subvol
+        hashed_subvol, count = find_hashed_subvol(subvols, "/", "parent")
+        if hashed_subvol is None:
+            g.log.error('Error in finding hash value')
+            return False
+
+        g.log.info("hashed subvol %s", hashed_subvol._host)
+
+        # bring hashed_subvol offline
+        ret = bring_bricks_offline(self.volname, subvols[count])
+        if ret == 0:
+            g.log.error('Error in bringing down subvolume %s', subvols[count])
+            return False
+        g.log.info('target subvol %s is offline', subvols[count])
+
+        # this confirms both layout and stat of the directory
+        ret = validate_files_in_dir(self.clients[0],
+                                    self.mounts[0].mountpoint + '/parent_dir',
+                                    test_type=LAYOUT_IS_COMPLETE,
+                                    file_type=FILETYPE_DIRS)
+        self.assertTrue(ret, "Layout is not complete")
+        g.log.info('Layout is complete')
+
+        # bring up the subvol
+        ret = bring_bricks_online(self.mnode, self.volname, subvols[count],
+                                  bring_bricks_online_methods=None)
+        if ret == 0:
+            g.log.error("Error in bringing back subvol online")
+            return False
+        g.log.info('Subvol is back online')
+
+        # delete parent_dir
+        ret, _, err = g.run(self.clients[0], ("rmdir %s" % parent_dir))
+        if ret == 0:
+            g.log.error('rmdir failed for %s err: %s', parent_dir, err)
+        g.log.info("rmdir of directory %s successful", parent_dir)
+        return True
+
+    def mkdir_nonhashed_down(self, subvols, parent_dir):
+        '''
+        case -3:
+            - create dir
+            - bringdown a non-hashed subvol
+            - make sure stat is successful on the dir
+        '''
+        # pylint: disable=protected-access
+        # pylint: disable=pointless-string-statement
+        # create parent dir
+        ret, _, err = g.run(self.clients[0], ("mkdir %s" % parent_dir))
+        if ret != 0:
+            g.log.error('mkdir failed for %s err: %s', parent_dir, err)
+            return False
+
+        g.log.info("mkdir of parent directory %s successful", parent_dir)
+
+        # Find a non hashed subvolume(or brick)
+        nonhashed_subvol, count = find_nonhashed_subvol(subvols, "/", "parent")
+        if nonhashed_subvol is None:
+            g.log.error('Error in finding hash value')
+            return False
+
+        # bring nonhashed_subbvol offline
+        ret = bring_bricks_offline(self.volname, subvols[count])
+        if ret == 0:
+            g.log.error('Error in bringing down subvolume %s', subvols[count])
+            return False
+        g.log.info('target subvol %s is offline', subvols[count])
+
+        # this confirms both layout and stat of the directory
+        ret = validate_files_in_dir(self.clients[0],
+                                    self.mounts[0].mountpoint + '/parent_dir',
+                                    test_type=LAYOUT_IS_COMPLETE,
+                                    file_type=FILETYPE_DIRS)
+        self.assertTrue(ret, "Expected - Layout is complete")
+        g.log.info('Layout is complete')
+
+        # bring up the subvol
+        ret = bring_bricks_online(self.mnode, self.volname, subvols[count],
+                                  bring_bricks_online_methods=None)
+        if ret == 0:
+            g.log.error("Error in bringing back subvol online")
+            return False
+        g.log.info('Subvol is back online')
+
+        # delete parent_dir
+        ret, _, err = g.run(self.clients[0], ("rmdir %s" % parent_dir))
+        if ret != 0:
+            g.log.error('rmdir failed for %s err: %s', parent_dir, err)
+            return False
+        g.log.info("rmdir of directory %s successful", parent_dir)
+        return True
+
+    def test_lookup_dir(self):
+        '''
+        Test directory lookup.
+        '''
+        # pylint: disable=too-many-locals
+        mount_obj = self.mounts[0]
+        mountpoint = mount_obj.mountpoint
+
+        # directory that needs to be created
+        parent_dir = mountpoint + '/parent'
+
+        # calculate hash for name "parent"
+        subvols = (get_subvols(self.mnode, self.volname))['volume_subvols']
+
+        # This populates one brick from one subvolume
+        secondary_bricks = []
+        for subvol in subvols:
+            secondary_bricks.append(subvol[0])
+
+        for subvol in secondary_bricks:
+            g.log.debug("secondary bricks %s", subvol)
+
+        brickobject = []
+        for item in secondary_bricks:
+            temp = BrickDir(item)
+            brickobject.append(temp)
+
+        ret = self.mkdir_post_hashdown(subvols, parent_dir)
+        self.assertTrue(ret, 'mkdir_post_hashdown failed')
+
+        ret = self.mkdir_before_hashdown(subvols, parent_dir)
+        self.assertTrue(ret, 'mkdir_before_hashdown failed')
+
+        ret = self.mkdir_nonhashed_down(subvols, parent_dir)
+        self.assertTrue(ret, 'mkdir_nonhashed_down failed')
+
+    def _validate_io(self):
+        """Validare I/O threads running on mount point"""
+        io_success = []
+        for proc in self.proc_list:
+            try:
+                ret, _, _ = proc.async_communicate()
+                if ret:
+                    io_success.append(False)
+                    break
+                io_success.append(True)
+            except ValueError:
+                io_success.append(True)
+        return all(io_success)
+
+    def test_time_taken_for_ls(self):
+        """
+        Test case:
+        1. Create a volume of type distributed-replicated or
+           distributed-arbiter or distributed-dispersed and start it.
+        2. Mount the volume to clients and create 2000 directories
+           and 10 files inside each directory.
+        3. Wait for I/O to complete on mount point and perform ls
+           (ls should complete within 10 seconds).
+        """
+
+        is_io_running = False
+        # Creating 2000 directories on the mount point
+        ret, _, _ = g.run(self.mounts[0].client_system,
+                          "cd %s; for i in {1..2000};do mkdir dir$i;done"
+                          % self.mounts[0].mountpoint)
+        self.assertFalse(ret, 'Failed to create 2000 dirs on mount point')
+
+        # Create 5000 files inside each directory
+        dirs = ('{1..100}', '{101..200}', '{201..300}', '{301..400}',
+                '{401..500}', '{501..600}', '{601..700}', '{701..800}',
+                '{801..900}', '{901..1000}', '{1001..1100}', '{1101..1200}',
+                '{1201..1300}', '{1301..1400}', '{1401..1500}', '{1501..1600}',
+                '{1801..1900}', '{1901..2000}')
+        self.proc_list, counter = [], 0
+        while counter < 18:
+            for mount_obj in self.mounts:
+                ret = g.run_async(mount_obj.client_system,
+                                  "cd %s;for i in %s;do "
+                                  "touch dir$i/file{1..10};done"
+                                  % (mount_obj.mountpoint, dirs[counter]))
+                self.proc_list.append(ret)
+                counter += 1
+        is_io_running = True
+
+        # Check if I/O is successful or not
+        ret = self._validate_io()
+        self.assertTrue(ret, "Failed to create Files and dirs on mount point")
+        is_io_running = False
+        g.log.info("Successfully created files and dirs needed for the test")
+
+        # Run ls on mount point which should get completed within 10 seconds
+        ret, _, _ = g.run(self.mounts[0].client_system,
+                          "cd %s; timeout 10 ls"
+                          % self.mounts[0].mountpoint)
+        self.assertFalse(ret, '1s taking more than 10 seconds')
+        g.log.info("ls completed in under 10 seconds")
+
+
